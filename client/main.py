@@ -3,14 +3,20 @@ from dotenv import load_dotenv
 import requests
 from requests.auth import HTTPBasicAuth
 import os
+from pathlib import Path
 
+# --- Configuration ---
 
 load_dotenv()
-
 
 API_URL=os.getenv("API_URL")
 
 st.set_page_config(page_title="Healthcare RBAC RAG Chatbot",layout="centered")
+
+# Set the base directory for local image access (Must match IMAGE_DIR in vectorstore.py)
+# Assuming Streamlit is running locally and has access to the directory where FastAPI saves images
+IMAGE_DIR = "./uploaded_images" 
+
 
 # Session state initalization
 if "username" not in st.session_state:
@@ -24,9 +30,10 @@ if "username" not in st.session_state:
 def get_auth():
     return HTTPBasicAuth(st.session_state.username,st.session_state.password)
 
-# Auth UI
+# --- UI Functions (auth_ui and upload_docs remain unchanged) ---
 
 def auth_ui():
+    # ... (Auth UI code remains unchanged) ...
     st.title("Healthcare RBAC RAG")
     st.subheader("Login or Signup")
 
@@ -66,12 +73,11 @@ def auth_ui():
                 st.error(res.json().get("detail","Signup failed"))
 
 
-
-# Upload PDF (Admin only)
 def upload_docs():
+    # ... (Upload docs code remains unchanged) ...
     st.subheader("Upload PDF for specific Role")
     uploaded_file=st.file_uploader("Choose a PDF file",type=["pdf"])
-    role_for_doc=st.selectbox("Target Role dor docs",["doctor","nurse","patient","other"])
+    role_for_doc=st.selectbox("Target Role dor docs",["admin","doctor","nurse","patient","other"])
 
     if st.button("Upload Document"):
         if uploaded_file:
@@ -88,8 +94,7 @@ def upload_docs():
             st.warning("Please upload a file")
 
 
-
-# chat interface
+# Chat interface (MODIFIED)
 def chat_interface():
     st.subheader("Ask a healthcare question")
     msg=st.text_input("Your query")
@@ -97,20 +102,46 @@ def chat_interface():
     if st.button("Send"):
         if not msg.strip():
             st.warning("Please enter a query")
+            return
         
+        # Call the FastAPI chat endpoint
         res=requests.post(f"{API_URL}/chat",data={"message":msg},auth=get_auth())
+        
         if res.status_code==200:
             reply=res.json()
+            
             st.markdown('### Answer: ')
             st.success(reply["answer"])
+
+            # 🖼️ NEW: Display Retrieved Images 🖼️
+            if reply.get("retrieved_images"):
+                st.markdown("#### Relevant Images Found:")
+                cols = st.columns(len(reply["retrieved_images"]))
+                
+                for i, img_path in enumerate(reply["retrieved_images"]):
+                    # Create the full local path for Streamlit access
+                    # We assume the path returned (e.g., './uploaded_images/...') is accessible.
+                    local_img_path = Path(img_path) 
+                    
+                    if local_img_path.exists():
+                        try:
+                            # Use st.image to display the local file
+                            cols[i].image(str(local_img_path), caption=f"Source: {local_img_path.name}")
+                        except Exception as e:
+                            cols[i].warning(f"Could not load image: {e}")
+                    else:
+                        cols[i].error(f"Image not found locally: {local_img_path}")
+
+            # Display Text Sources
             if reply.get("sources"):
+                st.markdown("#### Document Sources:")
                 for src in reply["sources"]:
-                    st.write(f"--{src}")
+                    st.write(f"-- {src}")
         else:
-            st.error(res.json().get("detail","Something is wrong."))
+            st.error(res.json().get("detail",f"Chat failed with status code {res.status_code}."))
 
 
-# main flow
+# --- Main Flow ---
 if not st.session_state.logged_in:
     auth_ui()
 else:
