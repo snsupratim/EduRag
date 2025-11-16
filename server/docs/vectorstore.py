@@ -1,232 +1,193 @@
-import os
-import time
-import asyncio
-import uuid
-import base64
-import io
+import os, io, cv2, fitz, pdfplumber, asyncio, time
+from PIL import Image
+import numpy as np
+import easyocr
+from tqdm.auto import tqdm
 from pathlib import Path
 from dotenv import load_dotenv
-from tqdm.auto import tqdm
-
-# === New Imports for Multimodal ===
-import cohere
-import fitz  # PyMuPDF for PDF extraction
-from PIL import Image
-# ==================================
-
 from pinecone import Pinecone, ServerlessSpec
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 load_dotenv()
 
-# === API Keys and Setup ===
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") 
-PINECONE_ENV = os.getenv("PINECONE_ENV")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAMES")
-COHERE_API_KEY = os.getenv("COHERE_API_KEY") 
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_ENV = os.getenv("PINECONE_ENV") or "us-east-1"
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME") or "medical-rag-index"
+IMAGE_BASE_URL = os.getenv("API_URL", "http://127.0.0.1:8000") + "/page_images"  # static image URL base
 
-# Initialize Cohere Client
-co = cohere.Client(api_key=COHERE_API_KEY)
-
-# --- CRITICAL FIX: Set Model and Dimension for embed-v4.0 ---
-EMBED_MODEL = "embed-v4.0" 
-# Use 1024 for a balance, but 1536 is the default if not specified
-EMBEDDING_DIM = 1536 
-# -----------------------------------------------------------
-
-UPLOAD_DIR = "./uploaded_docs"
-IMAGE_DIR = "./uploaded_images"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(IMAGE_DIR, exist_ok=True)
+reader = easyocr.Reader(['en'], gpu=False)
 
 
-# --- Pinecone Setup ---
-pc = Pinecone(api_key=PINECONE_API_KEY)
-spec = ServerlessSpec(cloud='aws', region=PINECONE_ENV)
-existing_index = [i["name"] for i in pc.list_indexes()]
+async def load_vectorstore(uploaded_files, role: str, doc_id: str, upload_dir="./uploaded_docs"):
+    """Extracts text, tables, and images (with OCR) → embeds with Gemini → stores in Pinecone."""
 
-if PINECONE_INDEX_NAME not in existing_index:
-    pc.create_index(
-        name=PINECONE_INDEX_NAME,
-        dimension=EMBEDDING_DIM, # Match dimension to the model's output
-        metric="dotproduct",
-        spec=spec
-    )
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    spec = ServerlessSpec(cloud='aws', region=PINECONE_ENV)
+
+    # --- Ensure Index Exists ---
+    existing_indexes = [i["name"] for i in pc.list_indexes()]
+    if PINECONE_INDEX_NAME not in existing_indexes:
+        print(f"🧱 Creating Pinecone index: {PINECONE_INDEX_NAME}")
+        pc.create_index(
+            name=PINECONE_INDEX_NAME,
+            dimension=3072,
+            metric="dotproduct",
+            spec=spec
+        )
+
     while not pc.describe_index(PINECONE_INDEX_NAME).status["ready"]:
-        time.sleep(1)
+        print("⏳ Waiting for Pinecone index to be ready...")
+        time.sleep(2)
 
-index = pc.Index(PINECONE_INDEX_NAME)
+    index = pc.Index(PINECONE_INDEX_NAME)
+    # Ensure query endpoint is live
+    for i in range(10):
+        try:
+            index.describe_index_stats()
+            print("✅ Pinecone index ready & accessible.")
+            break
+        except Exception:
+            print(f"⏳ Waiting for query endpoint ({i+1}/10)...")
+            time.sleep(3)
 
+    # --- Clear old vectors for same role ---
+    try:
+        index.delete(filter={"role": role})
+        print(f"🧹 Cleared old vectors for role '{role}'")
+    except Exception as e:
+        if "Namespace not found" in str(e):
+            print(f"ℹ️ No previous namespace found for role '{role}', skipping delete.")
+        else:
+            print(f"⚠️ Cleanup warning: {e}")
 
-# --- Multimodal Utility Functions ---
-MAX_PIXELS = 1568 * 1568 # Cohere image size limit
+    embed_model = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+    os.makedirs(upload_dir, exist_ok=True)
 
-def resize_image(pil_image):
-    """Resizes image to fit Cohere max pixel constraint if necessary."""
-    org_width, org_height = pil_image.size
-    if org_width * org_height > MAX_PIXELS:
-        scale_factor = (MAX_PIXELS / (org_width * org_height)) ** 0.5
-        new_width = int(org_width * scale_factor)
-        new_height = int(org_height * scale_factor)
-        # Use Image.Resampling.LANCZOS for high quality resizing
-        pil_image.thumbnail((new_width, new_height), Image.Resampling.LANCZOS)
-    return pil_image
-
-def image_to_base64_data_url(img_path):
-    """Converts a local image path to a base64 Data URL (required for some Cohere API calls)."""
-    pil_image = Image.open(img_path).convert("RGB")
-    resized_image = resize_image(pil_image)
-
-    img_buffer = io.BytesIO()
-    resized_image.save(img_buffer, format='PNG')
-    img_buffer.seek(0)
-    
-    encoded_string = base64.b64encode(img_buffer.read()).decode("utf-8")
-    return "data:image/png;base64," + encoded_string
-
-
-# --- Main Vectorstore Loading Function ---
-async def load_vectorstore(uploaded_files, role: str, doc_id: str):
-    
     for file in uploaded_files:
-        save_path = Path(UPLOAD_DIR) / file.filename
+        save_path = Path(upload_dir) / file.filename
         with open(save_path, "wb") as f:
             f.write(file.file.read())
 
-        # 1. Extract Text and Images using PyMuPDF (fitz)
-        doc = fitz.open(save_path)
-        text_chunks_raw = []
-        image_data = [] # Stores: (img_path, page_num)
-        
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        print(f"📄 Processing: {file.filename}")
+        text_blocks = []
 
-        print(f"Extracting content from {file.filename}...")
-        for page_num in tqdm(range(len(doc)), desc="Extracting pages"):
-            page = doc[page_num]
-            
-            # Text Extraction and Splitting
-            text = page.get_text()
-            if text.strip():
-                temp_doc = Document(
-                    page_content=text, 
-                    metadata={"page": page_num, "source": file.filename}
-                )
-                chunks = splitter.split_documents([temp_doc])
-                text_chunks_raw.extend(chunks)
+        with pdfplumber.open(save_path) as pdf, fitz.open(save_path) as doc:
+            for page_num, page in enumerate(doc, start=1):
+                page_text = page.get_text("text").strip()
+                pdf_page = pdf.pages[page_num - 1]
 
-            # Image Extraction
-            images = page.get_images(full=True)
-            for img_index, img in enumerate(images):
-                xref = img[0]
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                img_ext = base_image["ext"]
-                img_filename = f"{doc_id}_page{page_num+1}_img{img_index+1}.{img_ext}"
-                img_path = Path(IMAGE_DIR) / img_filename
-
-                with open(img_path, "wb") as f:
-                    f.write(image_bytes)
-                
-                image_data.append({
-                    "path": str(img_path),
-                    "page": page_num,
-                    "filename": img_filename
+                # ---- Table extraction (strong settings) ----
+                tables = pdf_page.extract_tables(table_settings={
+                    "vertical_strategy": "lines",
+                    "horizontal_strategy": "lines",
+                    "intersection_x_tolerance": 5,
+                    "intersection_y_tolerance": 5,
                 })
-        
-        
-        # 2. Embed and Upsert Text Chunks
-        texts = [chunk.page_content for chunk in text_chunks_raw]
-        text_ids = [f"text-{doc_id}-{uuid.uuid4()}" for _ in range(len(texts))]
-        text_metadatas = [
-            {
-                "source": file.filename,
-                "doc_id": doc_id,
-                "role": role,
-                "page": chunk.metadata.get("page", 0),
-                "type": "text",
-                "text": chunk.page_content,
-            }
-            for i, chunk in enumerate(text_chunks_raw)
-        ]
+                if tables:
+                    for table in tables:
+                        table_text = "\n".join([" | ".join([cell or '' for cell in row]) for row in table])
+                        text_blocks.append({
+                            "text": "TABLE DATA:\n" + table_text,
+                            "type": "table",
+                            "page": page_num,
+                            "source": file.filename
+                        })
+                else:
+                    # Fallback OCR if pdfplumber found nothing
+                    pix = page.get_pixmap(dpi=200)
+                    img_arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+                    ocr_text = "\n".join(reader.readtext(img_arr, detail=0, paragraph=True)).strip()
+                    if " | " in ocr_text or ":" in ocr_text:
+                        text_blocks.append({
+                            "text": "OCR TABLE (fallback):\n" + ocr_text,
+                            "type": "ocr_table",
+                            "page": page_num,
+                            "source": file.filename
+                        })
 
-        print(f"Embedding {len(texts)} text chunks with Cohere...")
-        
-        # Cohere Embedding Call for Text
-        text_embeddings_res = await asyncio.to_thread(
-            co.embed,
-            model=EMBED_MODEL,
-            texts=texts,
-            input_type="search_document",
-            # output_dimension=EMBEDDING_DIM # 👈 PASS DIMENSION HERE
-        )
-        text_embeddings = text_embeddings_res.embeddings
-        
-        # Upsert Text Vectors
-        print("Uploading text to Pinecone...")
-        # Since text_vectors is a zip object, we convert it to a list before iterating
-        text_vectors = list(zip(text_ids, text_embeddings, text_metadatas)) 
-        
-        # Batch upsert 
-        for i in tqdm(range(0, len(text_vectors), 100), desc="Upserting Text Batches"):
-            batch_vectors = text_vectors[i:i+100]
-            index.upsert(vectors=batch_vectors)
+                # ---- OCR for scanned pages ----
+                if len(page_text) < 50:
+                    pix = page.get_pixmap(dpi=350)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+                    gray = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+                    _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    ocr_text = "\n".join(reader.readtext(gray, detail=0, paragraph=True)).strip()
+                    if ocr_text:
+                        text_blocks.append({
+                            "text": ocr_text,
+                            "type": "ocr_page",
+                            "page": page_num,
+                            "source": file.filename
+                        })
+                        print(f"📃 Page {page_num}: OCR text extracted.")
+                else:
+                    text_blocks.append({
+                        "text": page_text,
+                        "type": "text",
+                        "page": page_num,
+                        "source": file.filename
+                    })
 
+                # ---- Image extraction ----
+                images = page.get_images(full=True)
+                for i_idx, img in enumerate(images):
+                    xref = img[0]
+                    base_img = doc.extract_image(xref)
+                    img_data = base_img["image"]
+                    img_ext = base_img["ext"]
 
-        # 3. Embed and Upsert Images 
-        image_vectors = []
-        
-        print(f"Embedding {len(image_data)} images with Cohere...")
-        for i, img_data in tqdm(enumerate(image_data), desc="Embedding Images"):
-            img_path = img_data["path"]
-            img_filename = img_data["filename"]
-            
-            try:
-                # CRITICAL FIX: Use the base64 data URL input format for multimodal
-                base64_url = image_to_base64_data_url(img_path)
-                
-                image_input = {
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": base64_url}}
-                    ]
-                }
-                
-                image_embed_res = await asyncio.to_thread(
-                    co.embed,
-                    model=EMBED_MODEL,
-                    inputs=[image_input], # Pass multimodal input via 'inputs'
-                    input_type="search_document",
-                    # output_dimension=EMBEDDING_DIM # 👈 PASS DIMENSION HERE
-                )
-                image_emb = image_embed_res.embeddings[0]
-                
-                # No need for co.files.upload/delete if using base64 URL directly
+                    image_dir = Path(upload_dir) / "page_images"
+                    image_dir.mkdir(parents=True, exist_ok=True)
+                    file_stem = Path(file.filename).stem
+                    img_path = image_dir / f"{file_stem}_page{page_num}_img{i_idx}.{img_ext}"
+                    with open(img_path, "wb") as out:
+                        out.write(img_data)
 
-                image_vectors.append((
-                    f"image-{doc_id}-{uuid.uuid4()}",
-                    image_emb,
-                    {
-                        "source": file.filename,
-                        "doc_id": doc_id,
-                        "role": role,
-                        "page": img_data["page"],
+                    img_cv = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
+                    img_text = "\n".join(reader.readtext(img_cv, detail=0, paragraph=True)).strip()
+
+                    image_url = f"{IMAGE_BASE_URL}/{img_path.name}"
+                    text_blocks.append({
+                        "text": img_text if img_text else "[Image with no detected text]",
                         "type": "image",
-                        "img_path": img_path, 
-                        "text": f"A relevant image from page {img_data['page']} of document {file.filename}." 
-                    }
-                ))
-            except Exception as e:
-                print(f"⚠️ Error processing image {img_filename}: {e}")
-                
-        # Upsert Image Vectors
-        print(f"Uploading {len(image_vectors)} image vectors to Pinecone...")
-        if image_vectors:
-            # Batch upsert for images
-            for i in tqdm(range(0, len(image_vectors), 100), desc="Upserting Image Batches"):
-                batch_vectors = image_vectors[i:i+100]
-                index.upsert(vectors=batch_vectors)
+                        "page": page_num,
+                        "source": file.filename,
+                        "image_path": image_url
+                    })
+                    print(f"🖼️ Page {page_num}: Image {i_idx} ({'with text' if img_text else 'no text'})")
 
+        # ---- Embed and upsert ----
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        all_chunks, metas = [], []
+        for blk in text_blocks:
+            chunks = splitter.split_text(blk["text"])
+            for c in chunks:
+                all_chunks.append(c)
+                metas.append({
+                    "source": blk["source"],
+                    "doc_id": doc_id,
+                    "role": role,
+                    "page": blk["page"],
+                    "type": blk["type"],
+                    "image_path": blk.get("image_path") or "",
+                    "text": c
+                })
 
-        print(f"Upload complete for {file.filename} (Text and Images)")
+        if not all_chunks:
+            print(f"⚠️ No text extracted from {file.filename}")
+            continue
+
+        print(f"🧠 Embedding {len(all_chunks)} chunks...")
+        embeddings = await asyncio.to_thread(embed_model.embed_documents, all_chunks)
+        ids = [f"{doc_id}-{i}" for i in range(len(all_chunks))]
+
+        print("🚀 Upserting to Pinecone...")
+        with tqdm(total=len(embeddings), desc="Pinecone Upsert") as bar:
+            index.upsert(vectors=zip(ids, embeddings, metas))
+            bar.update(len(embeddings))
+
+        print(f"✅ Upload complete for {file.filename}")
+
+    print("🎉 All documents processed successfully!")
