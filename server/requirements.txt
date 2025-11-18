@@ -17,6 +17,7 @@ langchain-google-genai
 
 # PDF Parsing
 PyPDF  # backend for PyPDFLoader via langchain_community
+PyMuPDF
 
 # Environment Variables
 python-dotenv
