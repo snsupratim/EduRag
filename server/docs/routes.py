@@ -4,13 +4,12 @@ from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
 from auth.routes import authenticate
 from docs.vectorstore import load_vectorstore
 import uuid
-from pinecone import Pinecone, ServerlessSpec
+from pinecone import Pinecone
 import os
-import time
-from pathlib import Path
 
-import fitz  # PyMuPDF
-import pdfplumber
+
+
+
 from dotenv import load_dotenv
 
 
