@@ -1,83 +1,104 @@
+# 📁 chat/chat_query.py
+
 import asyncio
 import os
 from dotenv import load_dotenv
 from pinecone import Pinecone
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_core.prompts import PromptTemplate
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME") or "enterprise-rag-index"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not PINECONE_API_KEY:
+    raise ValueError("PINECONE_API_KEY is not set in environment")
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX_NAME)
+
 embed_model = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
-llm = ChatGroq(temperature=0.3, model_name="llama-3.3-70b-versatile", groq_api_key=GROQ_API_KEY)
-# ---- Multimodal LLM (Gemini 2.5 Flash) ----
-# llm = GoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3,google_api_key=GEMINI_API_KEY)
+llm = ChatGroq(
+    temperature=0.1,
+    model_name="llama-3.3-70b-versatile",
+    groq_api_key=GROQ_API_KEY,
+)
 
-prompt = ChatPromptTemplate.from_template("""
-You are a helpful assistant that can analyze both text and images.
-Use the provided text context and attached images to answer the user's question accurately.
+prompt = ChatPromptTemplate.from_template(
+    """
+You are an enterprise knowledge assistant.
+You answer questions strictly based on the provided context, which comes from internal company PDFs
+such as reports, manuals, and policies.
 
-If an image is relevant, describe it briefly before analyzing.
-If not, answer only from text and tables.
+Guidelines:
+- Use only the information found in the Context.
+- If the answer is not clearly present in the Context, say:
+  "I do not have information on this from the available documents."
+- Be concise but clear. If useful, enumerate key points.
 
 Question:
 {question}
 
 Context:
 {context}
-""")
+"""
+)
 
 rag_chain = prompt | llm
 
 
 async def answer_query(query: str, user_role: str):
-    """Retrieve role-specific info, filter image/table context intelligently."""
+    """
+    Retrieve role-filtered chunks from Pinecone and answer using LLM.
+
+    - Only chunks with metadata.role == user_role are considered.
+    - Returns: { "answer": str, "sources": [filenames...] }
+    """
+    # 1. Embed query
     embedding = await asyncio.to_thread(embed_model.embed_query, query)
-    results = await asyncio.to_thread(index.query, vector=embedding, top_k=5, include_metadata=True)
 
-    filtered_contexts, sources, retrieved_images, retrieved_tables = [], set(), [], []
+    # 2. Query Pinecone
+    results = await asyncio.to_thread(
+        index.query,
+        vector=embedding,
+        top_k=8,
+        include_metadata=True,
+    )
 
-    for match in results["matches"]:
-        meta = match["metadata"]
+    contexts = []
+    sources = set()
+
+    for match in results.get("matches", []):
+        meta = match.get("metadata", {})
+
+        # Role-based filtering
         if meta.get("role") != user_role:
             continue
 
-        # ---- Smart filtering ----
-        chunk_type = meta.get("type", "")
-        # If user didn't ask for charts/images/visuals, skip image chunks
-        if chunk_type == "image" and not any(
-            word in query.lower() for word in ["see", "chart", "graph", "figure", "image", "diagram", "visual"]
-        ):
-            continue
+        text = meta.get("text", "")
+        if text and text.strip():
+            contexts.append(text.strip())
+            sources.add(meta.get("source"))
 
-        # Collect tables separately
-        if "table" in chunk_type:
-            retrieved_tables.append(meta.get("text", ""))
+    if not contexts:
+        return {
+            "answer": "No relevant information found in the accessible documents.",
+            "sources": [],
+        }
 
-        filtered_contexts.append(meta.get("text", ""))
-        if meta.get("image_path"):
-            retrieved_images.append(meta.get("image_path"))
-        sources.add(meta.get("source"))
+    docs_text = "\n\n".join(contexts)
 
-    if not filtered_contexts:
-        return {"answer": "No relevant information found.", "sources": [], "retrieved_images": [], "retrieved_tables": []}
-
-    docs_text = "\n".join(filtered_contexts)
-    final_answer = await asyncio.to_thread(rag_chain.invoke, {"question": query, "context": docs_text})
+    # 3. Run RAG LLM
+    answer = await asyncio.to_thread(
+        rag_chain.invoke,
+        {"question": query, "context": docs_text},
+    )
 
     return {
-        "answer": final_answer.content,
+        "answer": answer.content,
         "sources": list(sources),
-        "retrieved_images": list(set(retrieved_images)),
-        "retrieved_tables": list(set(retrieved_tables)),
     }
